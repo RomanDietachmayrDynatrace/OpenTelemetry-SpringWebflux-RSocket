@@ -1,5 +1,12 @@
 package com.example.client;
 
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
+import io.opentelemetry.context.propagation.TextMapSetter;
 import lombok.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.SpringApplication;
@@ -11,6 +18,9 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+
+import java.util.HashMap;
+import java.util.Map;
 
 @SpringBootApplication
 public class ClientApplication {
@@ -34,6 +44,9 @@ public class ClientApplication {
 @RequestMapping("/posts")
 class PostClientController {
 
+    private static final Tracer TRACER = GlobalOpenTelemetry.getTracer("custom-rsocket-instrumentation");
+    private static final TextMapSetter<Map<String, String>> SETTER = new MapTextMapSetter();
+
     private final RSocketRequester requester;
 
     @GetMapping("")
@@ -42,8 +55,29 @@ class PostClientController {
             return this.requester.route("posts.titleContains")
                     .data(title).retrieveFlux(Post.class);
         } else {
-            return this.requester.route("posts.findAll")
-                    .retrieveFlux(Post.class);
+            Span span = TRACER
+                    .spanBuilder("client-posts-findAll")
+                    .setSpanKind(SpanKind.CLIENT)
+                    .setAttribute("service.name", "PostClientController")
+                    .startSpan();
+
+            Map<String, String> tracecontext = new HashMap<>();
+
+            try (Scope scope = span.makeCurrent()) {
+
+                GlobalOpenTelemetry.get()
+                        .getPropagators()
+                        .getTextMapPropagator()
+                        .inject(Context.current(), tracecontext, SETTER);
+
+                System.out.println("Trace context: " + tracecontext);
+
+                return this.requester.route("posts.findAll")
+                        .data(tracecontext)
+                        .retrieveFlux(Post.class);
+            } finally {
+                span.end();
+            }
         }
     }
 
@@ -83,4 +117,11 @@ class Post {
     private Integer id;
     private String title;
     private String content;
+}
+
+class MapTextMapSetter implements TextMapSetter<Map<String, String>> {
+    @Override
+    public void set(Map<String, String> carrier, String key, String value) {
+        carrier.put(key, value);
+    }
 }

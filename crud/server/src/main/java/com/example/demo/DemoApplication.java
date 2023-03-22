@@ -1,5 +1,12 @@
 package com.example.demo;
 
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
+import io.opentelemetry.context.propagation.TextMapGetter;
 import io.r2dbc.spi.ConnectionFactory;
 import lombok.*;
 import lombok.extern.slf4j.Slf4j;
@@ -25,7 +32,9 @@ import org.springframework.stereotype.Controller;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 @SpringBootApplication
 public class DemoApplication {
@@ -82,11 +91,35 @@ class DataInitializer implements ApplicationRunner {
 @RequiredArgsConstructor
 class PostController {
 
+    private static final Tracer TRACER =
+            GlobalOpenTelemetry.getTracer("custom-rsocket-instrumentation");
+
+    private static final TextMapGetter<Map<String, String>> GETTER = new MapTextMapGetter();
+
     private final PostRepository posts;
 
     @MessageMapping("posts.findAll")
-    public Flux<Post> all() {
-        return this.posts.findAll();
+    public Flux<Post> all(@Payload HashMap<String, String> tracecontext) {
+
+        System.out.println("Trace context: " + tracecontext.toString());
+
+        Context extractedContext = GlobalOpenTelemetry.get()
+                .getPropagators()
+                .getTextMapPropagator()
+                .extract(Context.current(), tracecontext, GETTER);
+
+        try (Scope scope = extractedContext.makeCurrent()) {
+            Span span = TRACER
+                    .spanBuilder("server-posts-findAll")
+                    .setSpanKind(SpanKind.SERVER)
+                    .setAttribute("service.name", "PostController")
+                    .startSpan();
+
+            var posts = this.posts.findAll();
+
+            span.end();
+            return posts;
+        }
     }
 
     @MessageMapping("posts.titleContains")
@@ -148,4 +181,20 @@ class Post {
     @Column("content")
     private String content;
 
+}
+
+class MapTextMapGetter implements TextMapGetter<Map<String, String>> {
+
+    @Override
+    public String get(Map<String, String> carrier, String key) {
+        if (carrier != null) {
+            return carrier.get(key);
+        }
+        return null;
+    }
+
+    @Override
+    public Iterable<String> keys(Map<String, String> carrier) {
+        return carrier.keySet();
+    }
 }
